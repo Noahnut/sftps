@@ -646,6 +646,17 @@ mod tests {
         let file_list = response.unwrap();
         assert!(file_list.contains(&"test_upload.txt".to_string()), "File should be uploaded");
 
+        let result = client.change_directory("..");
+        assert!(result.is_ok(), "Failed to change directory");
+
+        let result = client.remove_file("test3/test_upload.txt");
+        assert!(result.is_ok(), "Failed to remove file");
+
+        let response = client.list_files();
+        assert!(response.is_ok(), "Failed to list files");
+        let file_list = response.unwrap();
+        assert!(!file_list.contains(&"test_upload.txt".to_string()), "File should be removed");
+
     }
 
     #[test]
