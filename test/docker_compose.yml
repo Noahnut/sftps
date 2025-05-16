@@ -1,0 +1,21 @@
+version: '3'
+
+services:
+  ftp:
+    image: dotkevinwong/vsftpd-arm
+    container_name: ftp_server
+    restart: always
+    ports:
+      - "21:21"
+      - "21000-21010:21000-21010"
+    environment:
+      - FTP_USER=user
+      - FTP_PASS=pass
+      - PASV_ADDRESS=192.168.0.103
+      - PASV_MIN_PORT=21000
+      - PASV_MAX_PORT=21010
+      - FILE_OPEN_MODE=0666
+      - LOCAL_UMASK=022
+      - REVERSE_LOOKUP_ENABLE=NO
+    volumes:
+      - ./ftpdata:/home/vsftpd
