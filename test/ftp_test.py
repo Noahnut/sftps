@@ -19,6 +19,8 @@ with open(test_file_path, "w") as f:
 
 client.upload_file(test_file_path, "test/test_upload.txt")
 
+client.download_file(remote_path="test/test_upload.txt", local_path="test_upload_clone.txt")
+
 s = client.list_details()
 for file in s:
     print(file.name)
@@ -30,3 +32,4 @@ client.remove_file("test/test_upload.txt")
 
 client.remove_directory(path="test", recursive=True, force=True)
 
+os.remove("test_upload_clone.txt")

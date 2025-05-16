@@ -161,4 +161,8 @@ impl FtpClient {
     pub fn upload_file(&mut self, local_path: &str, remote_path: &str) -> PyResult<()> {
         self.ftp_client.stor(local_path, remote_path).map_err(Into::into)
     }
+
+    pub fn download_file(&mut self, remote_path: &str, local_path: &str) -> PyResult<()> {
+        self.ftp_client.retr(remote_path, local_path).map_err(Into::into)
+    }
 }

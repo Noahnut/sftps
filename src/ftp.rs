@@ -216,7 +216,46 @@ impl _FtpClient {
         Ok(file_list)
     }
 
-    pub fn retr(&self, _remote_file: &str, _local_file: &str) -> Result<(), FtpError> {
+    pub fn retr(&mut self, _remote_file: &str, _local_file: &str) -> Result<(), FtpError> {
+
+        let mut connection = match self.data_connect_establish() {
+            Ok(conn) => conn,
+            Err(e) => return Err(e),
+        };
+
+        self.send_command(FtpCommand::Type(FtpType::Binary))?;
+
+        let response = self.read_response()?;
+
+        if !response.starts_with(FtpCode::OptsSuccess.as_str()) {
+            return Err(FtpError::SetBinaryModeError(response));
+        }
+
+        self.send_command(FtpCommand::Retr(_remote_file.to_string()))?;
+
+        let response = self.read_response()?;
+
+        if !response.starts_with(FtpCode::StartDataConnection.as_str()) {
+            return Err(FtpError::DownloadFileError(response));
+        }
+
+        let mut file = File::create(_local_file).map_err(|e| FtpError::DownloadFileError(e.to_string()))?;
+        let mut buffer = [0; 1024];
+        while let Ok(bytes_read) = connection.read_stream.read(&mut buffer) {
+            if bytes_read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..bytes_read]).map_err(|e| FtpError::DownloadFileError(e.to_string()))?;
+        }
+
+        file.flush().map_err(|e| FtpError::DownloadFileError(e.to_string()))?;
+
+        let response = self.read_response()?;
+
+        if !response.starts_with(FtpCode::DataConnectionClose.as_str()) {
+            return Err(FtpError::DownloadFileError(response));
+        }
+
         Ok(())
     }
 
@@ -699,6 +738,45 @@ mod tests {
 
         let result = client.remove_directory("test2", true, true);
         assert!(result.is_ok(), "Failed to remove directory");
+    }
+
+    #[test]
+    fn test_retr() {
+        init();
+        let mut client = _FtpClient::new();
+
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        
+        let result = client.connect(options);
+        assert!(result.is_ok(), "Failed to connect to FTP server");
+
+        let result = client.login("user", "pass");
+        assert!(result.is_ok(), "Failed to login to FTP server");
+
+        let result = client.mkdir("test4");
+        assert!(result.is_ok(), "Failed to make directory");
+
+        let test_content = "Hello, this is a test file for FTP upload!";
+        let test_file_path = "test_upload.txt";
+        std::fs::write(test_file_path, test_content).expect("Failed to create test file");  
+
+        let result = client.stor(test_file_path, "test4/test_upload.txt");
+        assert!(result.is_ok(), "Failed to upload file");
+
+        let result = client.retr("test4/test_upload.txt", "test_upload_clone.txt");
+        assert!(result.is_ok(), "Failed to download file");
+
+        let file_content = std::fs::read_to_string("test_upload_clone.txt").expect("Failed to read test file");
+        assert_eq!(file_content, test_content, "File content should be the same");
+
+        let result = client.remove_file("test4/test_upload.txt");
+        assert!(result.is_ok(), "Failed to remove file");
+
+        let result = client.remove_directory("test4", true, true);
+        assert!(result.is_ok(), "Failed to remove directory");
+        
+
+        std::fs::remove_file("test_upload_clone.txt").expect("Failed to remove test file");
     }
 }
 

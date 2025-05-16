@@ -45,6 +45,9 @@ pub enum FtpError {
 
     #[error("Failed to remove file: {0}")]
     RemoveFileError(String),
+
+    #[error("Failed to download file: {0}")]
+    DownloadFileError(String),
 }
 
 impl From<FtpError> for PyErr {

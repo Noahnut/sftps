@@ -99,6 +99,7 @@ pub enum FtpCommand {
     Stor(String),
     Type(FtpType),
     Dele(String),
+    Retr(String),
 }
 
 impl FtpCommand {
@@ -117,6 +118,7 @@ impl FtpCommand {
             FtpCommand::Stor(path) => format!("STOR {}\r\n", path),
             FtpCommand::Type(ftype) => format!("TYPE {}\r\n", ftype.to_string()),
             FtpCommand::Dele(path) => format!("DELE {}\r\n", path),
+            FtpCommand::Retr(path) => format!("RETR {}\r\n", path),
         }
     }
 }
@@ -137,6 +139,7 @@ impl fmt::Display for FtpCommand {
             FtpCommand::Stor(path) => write!(f, "STOR {}", path),
             FtpCommand::Type(ftype) => write!(f, "TYPE {}", ftype.to_string()),
             FtpCommand::Dele(path) => write!(f, "DELE {}", path),
+            FtpCommand::Retr(path) => write!(f, "RETR {}", path),
         }
     }
 }
