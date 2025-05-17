@@ -337,6 +337,12 @@ impl _FtpClient {
         Ok(())
     }
 
+    pub fn is_exist(&mut self, _path: &str) -> Result<bool, FtpError> {
+        let file_list = self.list_files()?;
+
+        Ok(file_list.contains(&_path.to_string()))
+    }
+
     fn send_command(&mut self, command: FtpCommand) -> Result<(), FtpError> {
         debug!("---> {}", command);
 

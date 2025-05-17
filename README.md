@@ -64,7 +64,7 @@ os.remove("test_upload_clone.txt")
 
 ## Todo
 
-- [ ] Auto create not exist remove directory
+- [X] Auto create not exist remove directory
 - [ ] FTPS
 - [ ] SFTP
 - [ ] Recursive or force delete directory

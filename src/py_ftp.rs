@@ -158,7 +158,43 @@ impl FtpClient {
         self.ftp_client.remove_file(path).map_err(Into::into)
     }
 
-    pub fn upload_file(&mut self, local_path: &str, remote_path: &str) -> PyResult<()> {
+    #[pyo3(signature = (local_path, remote_path, create_if_not_exist=None))]
+    pub fn upload_file(&mut self, local_path: &str, remote_path: &str, create_if_not_exist: Option<bool>) -> PyResult<()> {
+
+        let current_path = self.ftp_client.pwd().unwrap_or("".to_string());
+        
+        if create_if_not_exist.unwrap_or(false) {
+            let dir_path = if let Some(last_slash) = remote_path.rfind('/') {
+                &remote_path[..last_slash]
+            } else {
+                ""
+            };
+
+            let directory_list = dir_path.split("/").
+                                                filter(|&x| x != "").
+                                                collect::<Vec<&str>>();
+
+            for directory in directory_list {
+                if !self.ftp_client.is_exist(directory).unwrap_or(false) {
+                    let r = self.ftp_client.mkdir(directory);
+                    if let Err(e) = r {
+                        return Err(e.into());
+                    }
+                }
+
+                let r = self.ftp_client.change_directory(directory);
+                if let Err(e) = r {
+                    return Err(e.into());
+                }
+            }
+
+            let r = self.ftp_client.change_directory(current_path.as_str());
+            if let Err(e) = r {
+                return Err(e.into());
+            }
+        }
+
+
         self.ftp_client.stor(local_path, remote_path).map_err(Into::into)
     }
 
