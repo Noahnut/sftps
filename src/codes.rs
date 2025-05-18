@@ -33,8 +33,8 @@ pub enum FtpCode {
     #[error("Data connection close")]
     DataConnectionClose,
 
-    
-
+    #[error("Ready for TLS")]
+    ReadyForTLS,
 }
 
 
@@ -50,6 +50,7 @@ impl FtpCode {
             FtpCode::WorkDirCommandSuccess => "250",
             FtpCode::StartDataConnection => "150",
             FtpCode::DataConnectionClose => "226",
+            FtpCode::ReadyForTLS => "234",
 
         }
     }
@@ -100,6 +101,7 @@ pub enum FtpCommand {
     Type(FtpType),
     Dele(String),
     Retr(String),
+    AuthTLS,
 }
 
 impl FtpCommand {
@@ -119,6 +121,7 @@ impl FtpCommand {
             FtpCommand::Type(ftype) => format!("TYPE {}\r\n", ftype.to_string()),
             FtpCommand::Dele(path) => format!("DELE {}\r\n", path),
             FtpCommand::Retr(path) => format!("RETR {}\r\n", path),
+            FtpCommand::AuthTLS => "AUTH TLS\r\n".to_string(),
         }
     }
 }
@@ -140,6 +143,7 @@ impl fmt::Display for FtpCommand {
             FtpCommand::Type(ftype) => write!(f, "TYPE {}", ftype.to_string()),
             FtpCommand::Dele(path) => write!(f, "DELE {}", path),
             FtpCommand::Retr(path) => write!(f, "RETR {}", path),
+            FtpCommand::AuthTLS => write!(f, "AUTH TLS"),
         }
     }
 }

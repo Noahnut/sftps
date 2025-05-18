@@ -95,19 +95,21 @@ impl FtpClient {
         }
     }
     
-    #[pyo3(signature = (host=None, port=None, username=None, password=None, timeout=None, passive_mode=None))]
+    #[pyo3(signature = (host=None, port=None, username=None, password=None, timeout=None, passive_mode=None, tls_pem=None))]
     pub fn connect(&mut self, host: Option<String>,
                               port: Option<u16>, 
                               username: Option<String>, 
                               password: Option<String>, 
                               timeout: Option<u64>, 
-                            passive_mode: Option<bool>) -> PyResult<()> {
+                              passive_mode: Option<bool>,
+                              tls_pem: Option<String>) -> PyResult<()> {
         let options = FtpOptions::new(
             host.unwrap_or("127.0.0.1".to_string()),
             port.unwrap_or(21), passive_mode.unwrap_or(true),
             username.unwrap_or("user".to_string()), 
             password.unwrap_or("pass".to_string()), 
-            timeout.unwrap_or(10));
+            timeout.unwrap_or(10),
+            tls_pem.unwrap_or("".to_string()));
 
         self.ftp_client.connect(options).map_err(Into::into)
     }

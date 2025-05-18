@@ -2,38 +2,117 @@ use pyo3::prelude::*;
 use std::net::TcpStream;
 use std::io::{BufRead, BufReader, Error, ErrorKind, Read, Write};
 use crate::errors::FtpError;
-use crate::codes::FtpCode;
-use crate::codes::FtpCommand;
-use crate::codes::FtpOpts;
-use crate::codes::FtpType;
+use crate::codes::{FtpCode, FtpCommand, FtpOpts, FtpType};
 use std::time::Duration;
 use log::debug;
 use std::fs::File;
+use rustls::{StreamOwned, ClientConnection, ClientConfig, RootCertStore};
+use rustls::pki_types::{ServerName, CertificateDer};
 
+use webpki_roots::TLS_SERVER_ROOTS;
+use std::sync::Arc;
 enum TransferMode {
     Passive,
     Active,
 }
 
+enum SecurityMode {
+    TlsImplicit,
+    TlsExplicit,
+    None,
+}
+
+trait StreamWrapper: Send + Sync {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error>;
+    fn read_line(&mut self, buf: &mut String) -> Result<usize, Error>;
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Error>;
+    fn flush(&mut self) -> std::io::Result<()>;
+    fn shutdown(&mut self) -> std::io::Result<()>;
+    fn get_stream(&mut self) -> TcpStream;
+}
 
 
-#[derive(Default)]
+struct TcpStreamWrapper {
+    read_stream: Option<BufReader<TcpStream>>,
+    write_stream: Option<TcpStream>,
+}
+
+impl StreamWrapper for TcpStreamWrapper {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        self.read_stream.as_mut().unwrap().read(buf)
+    }
+
+    fn read_line(&mut self, buf: &mut String) -> Result<usize, Error> {
+        self.read_stream.as_mut().unwrap().read_line(buf)
+    }
+
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+        self.write_stream.as_mut().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.write_stream.as_mut().unwrap().flush()
+    }
+
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        self.write_stream.as_mut().unwrap().shutdown(std::net::Shutdown::Both)
+    }
+
+    fn get_stream(&mut self) -> TcpStream {
+        self.write_stream.as_mut().unwrap().try_clone().unwrap()
+    }
+}
+
+struct TlsStreamWrapper {
+    tls_stream: Option<StreamOwned<ClientConnection, TcpStream>>,
+}
+
+impl StreamWrapper for TlsStreamWrapper {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        self.tls_stream.as_mut().unwrap().read(buf)
+    }
+
+    fn read_line(&mut self, buf: &mut String) -> Result<usize, Error> {
+        self.tls_stream.as_mut().unwrap().read_line(buf)
+    }
+
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+        self.tls_stream.as_mut().unwrap().write(buf)
+    }      
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tls_stream.as_mut().unwrap().flush()
+    }
+
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        self.tls_stream.as_mut().unwrap().conn.send_close_notify();
+        Ok(())
+    }
+
+    fn get_stream(&mut self) -> TcpStream {
+        self.tls_stream.as_mut().unwrap().get_ref().try_clone().unwrap()
+    }
+}
+
+struct TLSConnectionMeta {
+    server_name: ServerName<'static>,
+    tls_config: Option<ClientConfig>,
+}
+
 struct FtpConnection {
-    ftp_write_stream: Option<TcpStream>,
-    ftp_read_stream: Option<BufReader<TcpStream>>,
+    control_stream: Box<dyn StreamWrapper>,
     passive_mode_connect_info: (String, u16),
+    tls_meta: Option<TLSConnectionMeta>,
 }
 
 struct DataConnection {
-    read_stream: BufReader<TcpStream>,
-    write_stream: Option<TcpStream>,
+    stream: Box<dyn StreamWrapper>,
 }
 
 impl Drop for DataConnection {
     fn drop(&mut self) {
-        if let Ok(stream) = self.read_stream.get_ref().try_clone() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
+        let _ = self.stream.shutdown(); 
+        let _ = self.stream.flush();
     }
 }
 
@@ -47,11 +126,18 @@ pub struct FtpOptions {
     pub username: String,
     pub password: String,
     pub timeout: u64,
+    pub tls_pem: String,
 }
 
 
 impl FtpOptions {
-    pub fn new(host: String, port: u16, passive_mode: bool, username: String, password: String, timeout: u64) -> Self {
+    pub fn new(host: String, 
+               port: u16, 
+               passive_mode: bool, 
+               username: String, 
+               password: String, 
+               timeout: u64,
+               tls_pem: String) -> Self {
         Self {
             host,
             port,
@@ -59,6 +145,7 @@ impl FtpOptions {
             username,
             password,
             timeout,
+            tls_pem,
         }
     }
 }
@@ -66,7 +153,8 @@ impl FtpOptions {
 
 pub struct _FtpClient {
     options: FtpOptions,
-    connection: FtpConnection,
+    connection: Option<FtpConnection>,
+    security_mode: SecurityMode,
     transfer_mode: TransferMode,
 }
 
@@ -75,10 +163,12 @@ impl _FtpClient {
     pub fn new() -> Self {
         Self {
             options: FtpOptions::default(),
-            connection: FtpConnection::default(),
+            connection: None,
             transfer_mode: TransferMode::Passive,
+            security_mode: SecurityMode::None,
         }
     }
+
     pub fn connect(&mut self, options: FtpOptions) -> Result<(), FtpError> {
         self.options = options;
 
@@ -87,8 +177,14 @@ impl _FtpClient {
         match TcpStream::connect(format!("{}:{}", self.options.host.clone(), self.options.port)) {
             Ok(stream) => {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(self.options.timeout)));
-                self.connection.ftp_write_stream = Some(stream.try_clone().unwrap());
-                self.connection.ftp_read_stream = Some(BufReader::new(stream));
+                self.connection = Some(FtpConnection {
+                    control_stream: Box::new(TcpStreamWrapper {
+                        read_stream: Some(BufReader::new(stream.try_clone().unwrap())),
+                        write_stream: Some(stream),
+                    }),
+                    passive_mode_connect_info: (self.options.host.clone(), self.options.port),
+                    tls_meta: None,
+                });
                 
                 let response = self.read_response()?;
                 if !response.starts_with(FtpCode::Ready.as_str()) {
@@ -106,6 +202,66 @@ impl _FtpClient {
             Err(e) => Err(FtpError::ConnectError(e)),
         }
     }
+
+
+    pub fn connect_tls_implicit(&mut self) -> Result<(), FtpError> {
+        self.security_mode = SecurityMode::TlsImplicit;
+        todo!()
+    }
+
+    pub fn connect_tls_explicit(&mut self, options: FtpOptions) -> Result<(), FtpError> {
+
+       let r = self.connect(options);
+
+       if r.is_err() {
+            return Err(r.unwrap_err());
+       }
+
+       self.send_command(FtpCommand::AuthTLS)?;
+
+       let response = self.read_response()?;
+
+       debug!("<--- {}", response);
+
+       if !response.starts_with(FtpCode::ReadyForTLS.as_str()) {
+            return Err(FtpError::SSLConnectionError(response));
+       }
+
+       let mut root_store = RootCertStore::empty();
+       root_store.extend(TLS_SERVER_ROOTS.iter().map(|cert| cert.clone()));
+
+       if self.options.tls_pem.len() > 0 {
+        let certs= CertificateDer::from_slice(self.options.tls_pem.as_bytes());
+        root_store.add(certs).unwrap();
+       }
+
+       let server_name = ServerName::try_from(self.options.host.clone())
+            .map_err(|e| FtpError::SSLConnectionError(e.to_string()))?;
+
+        let config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        self.connection.as_mut().unwrap().tls_meta = Some(TLSConnectionMeta {
+            server_name: server_name.clone(),
+            tls_config: Some(config.clone()),
+        });
+
+        let connection = ClientConnection::new(Arc::new(config), server_name)
+            .map_err(|e| FtpError::SSLConnectionError(e.to_string()))?;
+
+        let tls_stream = StreamOwned::new(
+            connection, self.connection.as_mut().unwrap().control_stream.as_mut().get_stream());
+        
+        self.connection.as_mut().unwrap().control_stream = Box::new(TlsStreamWrapper {
+            tls_stream: Some(tls_stream),
+        });
+
+        self.security_mode = SecurityMode::TlsExplicit;
+        
+       Ok(())
+    }
+
 
     pub fn login(&mut self, username: &str, password: &str) -> Result<(), FtpError> {
         debug!("---> {}", FtpCommand::Opts(FtpOpts::UTF8(true)));
@@ -241,7 +397,7 @@ impl _FtpClient {
 
         let mut file = File::create(_local_file).map_err(|e| FtpError::DownloadFileError(e.to_string()))?;
         let mut buffer = [0; 1024];
-        while let Ok(bytes_read) = connection.read_stream.read(&mut buffer) {
+        while let Ok(bytes_read) = connection.stream.as_mut().read(&mut buffer) {
             if bytes_read == 0 {
                 break;
             }
@@ -260,7 +416,7 @@ impl _FtpClient {
     }
 
     pub fn stor(&mut self, _local_file: &str, _remote_file: &str) -> Result<(), FtpError> {
-        let connection = match self.data_connect_establish() {
+        let mut connection = match self.data_connect_establish() {
             Ok(conn) => conn,
             Err(e) => return Err(e),
         };
@@ -287,11 +443,12 @@ impl _FtpClient {
             if bytes_read == 0 {
                 break;
             }
-            connection.write_stream.as_ref().unwrap().write_all(&buffer[..bytes_read]).map_err(|e| FtpError::UploadFileError(e.to_string()))?;
+            connection.stream.as_mut().write(&buffer[..bytes_read]).map_err(|e| FtpError::UploadFileError(e.to_string()))?;
         }
 
-        connection.write_stream.as_ref().unwrap().flush().map_err(|e| FtpError::UploadFileError(e.to_string()))?;
-        connection.write_stream.as_ref().unwrap().shutdown(std::net::Shutdown::Both).map_err(|e| FtpError::UploadFileError(e.to_string()))?;
+        connection.stream.as_mut().flush().map_err(|e| FtpError::UploadFileError(e.to_string()))?;
+        connection.stream.as_mut().shutdown().map_err(|e| FtpError::UploadFileError(e.to_string()))?;
+
 
 
         let response = self.read_response()?;
@@ -346,10 +503,9 @@ impl _FtpClient {
     fn send_command(&mut self, command: FtpCommand) -> Result<(), FtpError> {
         debug!("---> {}", command);
 
-        let mut stream = self.connection.ftp_write_stream.as_ref().
-                ok_or_else(|| FtpError::ConnectError(Error::new(ErrorKind::Other, "Failed to write to stream")))?;
+        let stream = self.connection.as_mut().unwrap().control_stream.as_mut();
 
-        stream.write_all(command.to_string().as_bytes()).map_err(FtpError::ConnectError)?;
+        stream.write(command.to_string().as_bytes()).map_err(FtpError::ConnectError)?;
         stream.flush().map_err(FtpError::ConnectError)?;
         Ok(())
     }
@@ -357,7 +513,7 @@ impl _FtpClient {
 
     fn read_response(&mut self) -> Result<String, FtpError> {
         let mut response = String::new();
-        self.connection.ftp_read_stream.as_mut().unwrap().read_line(&mut response).map_err(FtpError::ConnectError)?;
+        self.connection.as_mut().unwrap().control_stream.as_mut().read_line(&mut response).map_err(FtpError::ConnectError)?;
         debug!("<--- {}", response);
         Ok(response)
     }
@@ -371,7 +527,7 @@ impl _FtpClient {
         }
         
         let mut response = String::new();
-        connection.read_stream.read_line(&mut response).map_err(FtpError::ConnectError)?;
+        connection.stream.as_mut().read_line(&mut response).map_err(FtpError::ConnectError)?;
 
         let command_response = self.read_response()?;
 
@@ -388,13 +544,35 @@ impl _FtpClient {
             TransferMode::Passive => {
                 match self.passive_mode() {
                     Ok(_) => {
+
+                        let mut ftp_connection = self.connection.as_mut().unwrap();
+
                         let stream = TcpStream::connect(
-                            format!("{}:{}", self.connection.passive_mode_connect_info.0, 
-                                                    self.connection.passive_mode_connect_info.1)).unwrap();
-                        Ok(DataConnection {
-                            read_stream: BufReader::new(stream.try_clone().unwrap()),
-                            write_stream: Some(stream),
-                        })
+                            format!("{}:{}", ftp_connection.passive_mode_connect_info.0.clone(), 
+                                                    ftp_connection.passive_mode_connect_info.1)).unwrap();
+
+                        if ftp_connection.tls_meta.is_some() {
+                            let client_connection = ClientConnection::new(
+                                Arc::new(ftp_connection.tls_meta.as_ref().unwrap().tls_config.as_ref().unwrap().clone()), 
+                                ftp_connection.tls_meta.as_ref().unwrap().server_name.clone())
+                                .map_err(|e| FtpError::SSLConnectionError(e.to_string()))?;
+
+                            let tls_stream = StreamOwned::new(client_connection, stream);
+                            return Ok(DataConnection {
+                                stream: Box::new(TlsStreamWrapper {
+                                    tls_stream: Some(tls_stream),
+                                }),
+                            })
+                        } else {
+                            Ok(DataConnection {
+                                stream: Box::new(TcpStreamWrapper {
+                                    read_stream: Some(BufReader::new(stream.try_clone().unwrap())),
+                                    write_stream: Some(stream),
+                                }),
+                            })
+                        }
+                    
+                       
                     },
                     Err(e) => {
                         println!("Failed to establish passive mode will enter active mode: {}", e);
@@ -445,12 +623,12 @@ impl _FtpClient {
             }
         }
 
-        self.connection.passive_mode_connect_info.0 = host_vec.iter().map(|num| num.to_string()).collect::<Vec<String>>().join(".");
-        self.connection.passive_mode_connect_info.1 = port;
+        self.connection.as_mut().unwrap().passive_mode_connect_info.0 = host_vec.iter().map(|num| num.to_string()).collect::<Vec<String>>().join(".");
+        self.connection.as_mut().unwrap().passive_mode_connect_info.1 = port;
 
-        if self.connection.passive_mode_connect_info.0 != self.options.host.clone() {
-            debug!("Address returned by PASV {} seemed to be incorrect and has been fixed", self.connection.passive_mode_connect_info.0);
-            self.connection.passive_mode_connect_info.0 = self.options.host.clone();
+        if self.connection.as_mut().unwrap().passive_mode_connect_info.0 != self.options.host.clone() {
+            debug!("Address returned by PASV {} seemed to be incorrect and has been fixed", self.connection.as_mut().unwrap().passive_mode_connect_info.0);
+            self.connection.as_mut().unwrap().passive_mode_connect_info.0 = self.options.host.clone();
         }
 
         Ok(())
@@ -476,12 +654,12 @@ mod tests {
         init();
         let mut client = _FtpClient::new();
 
-        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
         
         let result = client.connect(options);
         assert!(result.is_ok(), "Failed to connect to FTP server");
 
-        let new_options = FtpOptions::new("nonexistent.server".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let new_options = FtpOptions::new("nonexistent.server".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
         
         let result = client.connect(new_options);
         assert!(result.is_err(), "Should fail to connect to non-existent server");
@@ -491,7 +669,7 @@ mod tests {
     fn test_ftp_login() {
         init();
         let mut client = _FtpClient::new();
-        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
         
         let result = client.connect(options);
         assert!(result.is_ok(), "Failed to connect to FTP server");
@@ -504,7 +682,7 @@ mod tests {
     fn test_list_details() {
         init();
         let mut client = _FtpClient::new();
-        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
         
         let result = client.connect(options);
         assert!(result.is_ok(), "Failed to connect to FTP server");
@@ -527,7 +705,7 @@ mod tests {
     fn test_pasv() {
         init();
         let mut client = _FtpClient::new();
-        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
         
         let result = client.connect(options);
         assert!(result.is_ok(), "Failed to connect to FTP server");
@@ -543,7 +721,7 @@ mod tests {
     fn test_pwd() {
         init();
         let mut client = _FtpClient::new();
-        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
 
         let result = client.connect(options);
         assert!(result.is_ok(), "Failed to connect to FTP server");
@@ -561,7 +739,7 @@ mod tests {
         init();
         let mut client = _FtpClient::new();
 
-        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
         
         let result = client.connect(options);
         assert!(result.is_ok(), "Failed to connect to FTP server"); 
@@ -577,7 +755,8 @@ mod tests {
 
         let response = client.list_details();
         assert!(response.is_ok(), "Failed to list files");
-        assert!(!response.unwrap()[0].contains("test"), "Directory should be removed");
+        let file_list = response.unwrap();
+        assert!(!file_list.contains(&"test".to_string()), "Directory should be removed");
     }
 
     #[test]
@@ -585,7 +764,7 @@ mod tests {
         init();
         let mut client = _FtpClient::new();
 
-        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
         
         let result = client.connect(options);
         assert!(result.is_ok(), "Failed to connect to FTP server");
@@ -609,7 +788,7 @@ mod tests {
         init();
         let mut client = _FtpClient::new();
 
-        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
         
         let result = client.connect(options);
         assert!(result.is_ok(), "Failed to connect to FTP server");
@@ -626,7 +805,7 @@ mod tests {
         init();
         let mut client = _FtpClient::new();
 
-        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
         
         let result = client.connect(options);
         assert!(result.is_ok(), "Failed to connect to FTP server");
@@ -652,7 +831,7 @@ mod tests {
         assert!(response.is_ok(), "Failed to get current directory");
         assert!(response.unwrap().contains("/"), "Current directory should be .");
         
-        let result = client.remove_directory("test", true, true);
+        let result = client.remove_directory("test2", true, true);
         assert!(result.is_ok(), "Failed to remove directory");
 
         let response = client.pwd();
@@ -666,7 +845,7 @@ mod tests {
         init();
         let mut client = _FtpClient::new();
         
-        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
         
         let result = client.connect(options);
         assert!(result.is_ok(), "Failed to connect to FTP server");
@@ -702,6 +881,8 @@ mod tests {
         let file_list = response.unwrap();
         assert!(!file_list.contains(&"test_upload.txt".to_string()), "File should be removed");
 
+        let result = client.remove_directory("test3", true, true);
+        assert!(result.is_ok(), "Failed to remove directory");
     }
 
     #[test]
@@ -709,7 +890,7 @@ mod tests {
         init();
         let mut client = _FtpClient::new();
 
-        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
         
         let result = client.connect(options);
         assert!(result.is_ok(), "Failed to connect to FTP server");
@@ -751,7 +932,7 @@ mod tests {
         init();
         let mut client = _FtpClient::new();
 
-        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10);
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "".to_string());
         
         let result = client.connect(options);
         assert!(result.is_ok(), "Failed to connect to FTP server");

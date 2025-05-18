@@ -48,6 +48,9 @@ pub enum FtpError {
 
     #[error("Failed to download file: {0}")]
     DownloadFileError(String),
+
+    #[error("Failed to connect to SSL: {0}")]
+    SSLConnectionError(String),
 }
 
 impl From<FtpError> for PyErr {
