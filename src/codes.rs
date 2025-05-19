@@ -35,6 +35,9 @@ pub enum FtpCode {
 
     #[error("Ready for TLS")]
     ReadyForTLS,
+
+    #[error("TLS process negotiation")]
+    TLSProcessNegotiation,
 }
 
 
@@ -51,7 +54,7 @@ impl FtpCode {
             FtpCode::StartDataConnection => "150",
             FtpCode::DataConnectionClose => "226",
             FtpCode::ReadyForTLS => "234",
-
+            FtpCode::TLSProcessNegotiation => "234",
         }
     }
 }
@@ -102,6 +105,7 @@ pub enum FtpCommand {
     Dele(String),
     Retr(String),
     AuthTLS,
+    Noop,
 }
 
 impl FtpCommand {
@@ -122,6 +126,7 @@ impl FtpCommand {
             FtpCommand::Dele(path) => format!("DELE {}\r\n", path),
             FtpCommand::Retr(path) => format!("RETR {}\r\n", path),
             FtpCommand::AuthTLS => "AUTH TLS\r\n".to_string(),
+            FtpCommand::Noop => "NOOP\r\n".to_string(),
         }
     }
 }
@@ -144,6 +149,7 @@ impl fmt::Display for FtpCommand {
             FtpCommand::Dele(path) => write!(f, "DELE {}", path),
             FtpCommand::Retr(path) => write!(f, "RETR {}", path),
             FtpCommand::AuthTLS => write!(f, "AUTH TLS"),
+            FtpCommand::Noop => write!(f, "NOOP"),
         }
     }
 }

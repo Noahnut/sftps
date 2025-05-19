@@ -1,4 +1,5 @@
 use pyo3::prelude::*;
+use rustls::pki_types::pem::PemObject;
 use std::net::TcpStream;
 use std::io::{BufRead, BufReader, Error, ErrorKind, Read, Write};
 use crate::errors::FtpError;
@@ -8,6 +9,7 @@ use log::debug;
 use std::fs::File;
 use rustls::{StreamOwned, ClientConnection, ClientConfig, RootCertStore};
 use rustls::pki_types::{ServerName, CertificateDer};
+use rustls::client::danger;
 
 use webpki_roots::TLS_SERVER_ROOTS;
 use std::sync::Arc;
@@ -77,7 +79,28 @@ impl StreamWrapper for TlsStreamWrapper {
     }
 
     fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        self.tls_stream.as_mut().unwrap().write(buf)
+        match self.tls_stream.as_mut() {
+            Some(stream) => {
+                let mut total_written = 0;
+                while total_written < buf.len() {
+                    match stream.write(&buf[total_written..]) {
+                        Ok(written) => {
+                            if written == 0 {
+                                return Err(Error::new(ErrorKind::Other, "Failed to write to TLS stream"));
+                            }
+                            total_written += written;
+                        }
+                        Err(e) => {
+                            return Err(Error::new(ErrorKind::Other, e.to_string()));
+                        }
+                    }
+                }
+
+                stream.flush()?;
+                Ok(total_written)
+            },
+            None => Err(Error::new(ErrorKind::Other, "TLS stream is not initialized")),
+        }
     }      
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -221,9 +244,7 @@ impl _FtpClient {
 
        let response = self.read_response()?;
 
-       debug!("<--- {}", response);
-
-       if !response.starts_with(FtpCode::ReadyForTLS.as_str()) {
+       if !response.starts_with(FtpCode::TLSProcessNegotiation.as_str()) {
             return Err(FtpError::SSLConnectionError(response));
        }
 
@@ -231,8 +252,15 @@ impl _FtpClient {
        root_store.extend(TLS_SERVER_ROOTS.iter().map(|cert| cert.clone()));
 
        if self.options.tls_pem.len() > 0 {
-        let certs= CertificateDer::from_slice(self.options.tls_pem.as_bytes());
-        root_store.add(certs).unwrap();
+        let certs= CertificateDer::from_pem_file(self.options.tls_pem.clone());
+        match certs {
+            Ok(certs) => {
+                root_store.add(certs).unwrap();
+            }
+            Err(e) => {
+                return Err(FtpError::SSLConnectionError(e.to_string()));
+            }
+        }
        }
 
        let server_name = ServerName::try_from(self.options.host.clone())
@@ -242,6 +270,7 @@ impl _FtpClient {
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
+        
         self.connection.as_mut().unwrap().tls_meta = Some(TLSConnectionMeta {
             server_name: server_name.clone(),
             tls_config: Some(config.clone()),
@@ -251,21 +280,23 @@ impl _FtpClient {
             .map_err(|e| FtpError::SSLConnectionError(e.to_string()))?;
 
         let tls_stream = StreamOwned::new(
-            connection, self.connection.as_mut().unwrap().control_stream.as_mut().get_stream());
-        
+            connection, 
+            self.connection.as_mut().unwrap().control_stream.as_mut().get_stream()
+        );
+
         self.connection.as_mut().unwrap().control_stream = Box::new(TlsStreamWrapper {
             tls_stream: Some(tls_stream),
         });
 
-        self.security_mode = SecurityMode::TlsExplicit;
         
+
+        self.security_mode = SecurityMode::TlsExplicit;
+
        Ok(())
     }
 
 
     pub fn login(&mut self, username: &str, password: &str) -> Result<(), FtpError> {
-        debug!("---> {}", FtpCommand::Opts(FtpOpts::UTF8(true)));
-
         self.send_command(FtpCommand::Opts(FtpOpts::UTF8(true)))?;
 
         let response = self.read_response()?;
@@ -505,8 +536,20 @@ impl _FtpClient {
 
         let stream = self.connection.as_mut().unwrap().control_stream.as_mut();
 
-        stream.write(command.to_string().as_bytes()).map_err(FtpError::ConnectError)?;
-        stream.flush().map_err(FtpError::ConnectError)?;
+        let result = stream.write(command.to_string().as_bytes());
+
+        if result.is_err() {
+            println!("Failed to send command: {}", result.as_ref().err().unwrap());
+            return Err(FtpError::ConnectError(result.err().unwrap()));
+        }
+
+        let result = stream.flush();
+
+        if result.is_err() {
+            println!("Failed to flush command: {}", result.as_ref().err().unwrap());
+            return Err(FtpError::ConnectError(result.err().unwrap()));
+        }
+
         Ok(())
     }
 
@@ -645,7 +688,7 @@ mod tests {
     use super::*;
 
     fn init() {
-        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).try_init();
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).try_init();
     }
 
 
@@ -964,6 +1007,20 @@ mod tests {
         
 
         std::fs::remove_file("test_upload_clone.txt").expect("Failed to remove test file");
+    }
+
+    #[test]
+    fn test_tls_explicit() {
+        init();
+        let mut client = _FtpClient::new();
+
+        let options = FtpOptions::new("127.0.0.1".to_string(), 21, true, "user".to_string(), "pass".to_string(), 10, "./test/ssl/vsftpd.pem".to_string());
+        
+        let result = client.connect_tls_explicit(options);
+        assert!(result.is_ok(), "Failed to connect to FTP server");
+
+        let result = client.login("user", "pass");
+        assert!(result.is_ok(), "Failed to login to FTP server");
     }
 }
 
